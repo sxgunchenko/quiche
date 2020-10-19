@@ -38,6 +38,9 @@ use libc::c_void;
 use libc::size_t;
 use libc::ssize_t;
 
+#[cfg(target_os = "linux")]
+use libc::timespec;
+
 use crate::*;
 
 #[no_mangle]
@@ -538,6 +541,40 @@ pub extern fn quiche_conn_send(
 
     match conn.send(out) {
         Ok(v) => v as ssize_t,
+
+        Err(e) => e.to_c(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+pub struct send_info {
+    pub send_time: timespec,
+}
+
+#[no_mangle]
+#[cfg(target_os = "linux")]
+pub extern fn quiche_conn_send_with_info(
+    conn: &mut Connection, out: *mut u8, out_len: size_t,
+    out_info: &mut send_info,
+) -> ssize_t {
+    if out_len > <ssize_t>::max_value() as usize {
+        panic!("The provided buffer is too large");
+    }
+
+    let out = unsafe { slice::from_raw_parts_mut(out, out_len) };
+
+    match conn.send_with_info(out) {
+        Ok((v, info)) => {
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    &info.send_time as *const _ as *const timespec,
+                    &mut out_info.send_time,
+                    1,
+                )
+            };
+            v as ssize_t
+        },
 
         Err(e) => e.to_c(),
     }

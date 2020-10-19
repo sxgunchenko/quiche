@@ -1986,10 +1986,12 @@ impl Connection {
         Ok(read)
     }
 
-    /// Writes a single QUIC packet to be sent to the peer.
+    /// Writes a single QUIC packet to be sent to the peer along with send_info
+    /// like to time to send the packet out.
     ///
     /// On success the number of bytes written to the output buffer is
-    /// returned, or [`Done`] if there was nothing to write.
+    /// returned along with send_info, or [`Done`] if there was nothing to
+    /// write.
     ///
     /// The application should call `send()` multiple times until [`Done`] is
     /// returned, indicating that there are no more packets to send. It is
@@ -2019,8 +2021,11 @@ impl Connection {
     /// # let scid = [0xba; 16];
     /// # let mut conn = quiche::accept(&scid, None, &mut config)?;
     /// loop {
-    ///     let write = match conn.send(&mut out) {
-    ///         Ok(v) => v,
+    ///     let write = match conn.send_with_info(&mut out) {
+    ///         Ok((v, send_info)) => {
+    ///             // Use send_info
+    ///             v
+    ///         },
     ///
     ///         Err(quiche::Error::Done) => {
     ///             // Done writing.
@@ -2037,7 +2042,9 @@ impl Connection {
     /// }
     /// # Ok::<(), quiche::Error>(())
     /// ```
-    pub fn send(&mut self, out: &mut [u8]) -> Result<usize> {
+    pub fn send_with_info(
+        &mut self, out: &mut [u8],
+    ) -> Result<(usize, SendInfo)> {
         let now = time::Instant::now();
 
         if out.is_empty() {
@@ -2796,6 +2803,10 @@ impl Connection {
             &self.trace_id,
         );
 
+        let out_info = SendInfo {
+            send_time: self.recovery.get_packet_send_time().unwrap_or(now),
+        };
+
         qlog_with!(self.qlog_streamer, q, {
             let ev = self.recovery.to_qlog();
             q.add_event(ev).ok();
@@ -2828,6 +2839,62 @@ impl Connection {
             self.ack_eliciting_sent = true;
         }
 
+        Ok((written, out_info))
+    }
+
+    /// Writes a single QUIC packet to be sent to the peer.
+    ///
+    /// On success the number of bytes written to the output buffer is
+    /// returned, or [`Done`] if there was nothing to write.
+    ///
+    /// The application should call `send()` multiple times until [`Done`] is
+    /// returned, indicating that there are no more packets to send. It is
+    /// recommended that `send()` be called in the following cases:
+    ///
+    ///  * When the application receives QUIC packets from the peer (that is,
+    ///    any time [`recv()`] is also called).
+    ///
+    ///  * When the connection timer expires (that is, any time [`on_timeout()`]
+    ///    is also called).
+    ///
+    ///  * When the application sends data to the peer (for examples, any time
+    ///    [`stream_send()`] or [`stream_shutdown()`] are called).
+    ///
+    /// [`Done`]: enum.Error.html#variant.Done
+    /// [`recv()`]: struct.Connection.html#method.recv
+    /// [`on_timeout()`]: struct.Connection.html#method.on_timeout
+    /// [`stream_send()`]: struct.Connection.html#method.stream_send
+    /// [`stream_shutdown()`]: struct.Connection.html#method.stream_shutdown
+    ///
+    /// ## Examples:
+    ///
+    /// ```no_run
+    /// # let mut out = [0; 512];
+    /// # let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    /// # let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
+    /// # let scid = [0xba; 16];
+    /// # let mut conn = quiche::accept(&scid, None, &mut config)?;
+    /// loop {
+    ///     let write = match conn.send(&mut out) {
+    ///         Ok(v) => v,
+    ///
+    ///         Err(quiche::Error::Done) => {
+    ///             // Done writing.
+    ///             break;
+    ///         },
+    ///
+    ///         Err(e) => {
+    ///             // An error occurred, handle it.
+    ///             break;
+    ///         },
+    ///     };
+    ///
+    ///     socket.send(&out[..write]).unwrap();
+    /// }
+    /// # Ok::<(), quiche::Error>(())
+    /// ```
+    pub fn send(&mut self, out: &mut [u8]) -> Result<usize> {
+        let (written, _) = self.send_with_info(out)?;
         Ok(written)
     }
 
@@ -4380,6 +4447,12 @@ fn drop_pkt_on_err(
     // Ignore other invalid packets that haven't been authenticated to prevent
     // man-in-the-middle and man-on-the-side attacks.
     Error::Done
+}
+
+/// Info send out on every send_with_info call.
+pub struct SendInfo {
+    /// Time to send the packet out.
+    pub send_time: time::Instant,
 }
 
 /// Statistics about the connection.

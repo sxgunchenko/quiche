@@ -119,6 +119,8 @@ pub struct Recovery {
 
     bytes_acked: usize,
 
+    bytes_sent: usize,
+
     congestion_recovery_start_time: Option<Instant>,
 
     max_datagram_size: usize,
@@ -127,6 +129,11 @@ pub struct Recovery {
 
     // HyStart++.
     hystart: hystart::Hystart,
+
+    // Pacing
+    pacing_rate: u64,
+
+    last_packet_scheduled_time: Option<Instant>,
 }
 
 impl Recovery {
@@ -181,6 +188,8 @@ impl Recovery {
 
             bytes_acked: 0,
 
+            bytes_sent: 0,
+
             congestion_recovery_start_time: None,
 
             max_datagram_size: config.max_send_udp_payload_size,
@@ -194,6 +203,10 @@ impl Recovery {
             app_limited: false,
 
             hystart: hystart::Hystart::new(config.hystart),
+
+            pacing_rate: 0,
+
+            last_packet_scheduled_time: None,
         }
     }
 
@@ -236,11 +249,60 @@ impl Recovery {
             self.hystart.start_round(pkt_num);
         }
 
+        // Pacing: Set the pacing rate if BBR is not used
+        if !(self.cc_ops.has_custom_pacing)() {
+            if let Some(srtt) = self.smoothed_rtt {
+                let rate = (self.congestion_window as u64 * 1000000) /
+                    srtt.as_micros() as u64;
+                self.set_pacing_rate(rate);
+            }
+        }
+
+        self.schedule_next_packet(epoch, now, sent_bytes);
+
+        self.bytes_sent += sent_bytes;
         trace!("{} {:?}", trace_id, self);
     }
 
     fn on_packet_sent_cc(&mut self, sent_bytes: usize, now: Instant) {
         (self.cc_ops.on_packet_sent)(self, sent_bytes, now);
+    }
+
+    pub fn set_pacing_rate(&mut self, rate: u64) {
+        if rate > 0 {
+            self.pacing_rate = rate;
+        }
+    }
+
+    pub fn get_packet_send_time(&self) -> Option<Instant> {
+        self.last_packet_scheduled_time
+    }
+
+    fn schedule_next_packet(
+        &mut self, epoch: packet::Epoch, now: Instant, packet_size: usize,
+    ) {
+        // Pacing is not done for following cases,
+        // 1. Packet epoch is not EPOCH_APPLICATION.
+        // 2. If packet has only ACK frames.
+        // 3. Start of the connection.
+        if epoch != packet::EPOCH_APPLICATION ||
+            packet_size == 0 ||
+            self.bytes_sent <= self.congestion_window ||
+            self.pacing_rate == 0
+        {
+            self.last_packet_scheduled_time = Some(now);
+            return;
+        }
+
+        let interval: u64 = (packet_size as u64 * 1000000) / self.pacing_rate;
+        let next_send_interval = Duration::from_micros(interval);
+
+        let next_schedule_time = match self.last_packet_scheduled_time {
+            Some(last_scheduled_time) => last_scheduled_time + next_send_interval,
+            None => now,
+        };
+
+        self.last_packet_scheduled_time = Some(cmp::max(now, next_schedule_time));
     }
 
     pub fn on_ack_received(
@@ -852,6 +914,8 @@ pub struct CongestionControlOps {
     ),
 
     pub collapse_cwnd: fn(r: &mut Recovery),
+
+    pub has_custom_pacing: fn() -> bool,
 }
 
 impl From<CongestionControlAlgorithm> for &'static CongestionControlOps {
@@ -898,6 +962,12 @@ impl std::fmt::Debug for Recovery {
             self.congestion_recovery_start_time
         )?;
         write!(f, "{:?} ", self.delivery_rate)?;
+        write!(f, "pacing_rate={:?}", self.pacing_rate)?;
+        write!(
+            f,
+            "last_packet_scheduled_time={:?}",
+            self.last_packet_scheduled_time
+        )?;
 
         if self.hystart.enabled() {
             write!(f, "hystart={:?} ", self.hystart)?;
@@ -1560,6 +1630,142 @@ mod tests {
 
         // Spurious loss.
         assert_eq!(r.lost_count, 1);
+    }
+
+    #[test]
+    fn test_packet_pacing() {
+        let mut cfg = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
+        cfg.set_cc_algorithm(CongestionControlAlgorithm::CUBIC);
+
+        let mut r = Recovery::new(&cfg);
+
+        let mut now = Instant::now();
+
+        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 0);
+
+        // send out first packet.
+        let p = Sent {
+            pkt_num: 0,
+            frames: vec![],
+            time_sent: now,
+            time_acked: None,
+            time_lost: None,
+            size: 6500,
+            ack_eliciting: true,
+            in_flight: true,
+            delivered: 0,
+            delivered_time: now,
+            recent_delivered_packet_sent_time: now,
+            is_app_limited: false,
+            has_data: false,
+        };
+
+        r.on_packet_sent(
+            p,
+            packet::EPOCH_APPLICATION,
+            HandshakeStatus::default(),
+            now,
+            "",
+        );
+
+        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 1);
+        assert_eq!(r.bytes_in_flight, 6500);
+
+        // First packet will be sent out immidiately.
+        assert_eq!(r.pacing_rate, 0);
+        assert_eq!(r.get_packet_send_time().unwrap(), now);
+
+        // Wait 50ms for ACK.
+        now += Duration::from_millis(50);
+
+        let mut acked = ranges::RangeSet::default();
+        acked.insert(0..1);
+
+        assert_eq!(
+            r.on_ack_received(
+                &acked,
+                10,
+                packet::EPOCH_APPLICATION,
+                HandshakeStatus::default(),
+                now,
+                ""
+            ),
+            Ok(())
+        );
+
+        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 0);
+        assert_eq!(r.bytes_in_flight, 0);
+        assert_eq!(r.smoothed_rtt.unwrap(), Duration::from_millis(50));
+
+        // Send out second packet.
+        let p = Sent {
+            pkt_num: 1,
+            frames: vec![],
+            time_sent: now,
+            time_acked: None,
+            time_lost: None,
+            size: 6500,
+            ack_eliciting: true,
+            in_flight: true,
+            delivered: 0,
+            delivered_time: now,
+            recent_delivered_packet_sent_time: now,
+            is_app_limited: false,
+            has_data: false,
+        };
+
+        r.on_packet_sent(
+            p,
+            packet::EPOCH_APPLICATION,
+            HandshakeStatus::default(),
+            now,
+            "",
+        );
+
+        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 1);
+        assert_eq!(r.bytes_in_flight, 6500);
+
+        // Pacing is not done during intial phase of connection.
+        assert_eq!(r.get_packet_send_time().unwrap(), now);
+
+        // Send the third packet out.
+        let p = Sent {
+            pkt_num: 2,
+            frames: vec![],
+            time_sent: now,
+            time_acked: None,
+            time_lost: None,
+            size: 6500,
+            ack_eliciting: true,
+            in_flight: true,
+            delivered: 0,
+            delivered_time: now,
+            recent_delivered_packet_sent_time: now,
+            is_app_limited: false,
+            has_data: false,
+        };
+
+        r.on_packet_sent(
+            p,
+            packet::EPOCH_APPLICATION,
+            HandshakeStatus::default(),
+            now,
+            "",
+        );
+
+        assert_eq!(r.sent[packet::EPOCH_APPLICATION].len(), 2);
+        assert_eq!(r.bytes_in_flight, 13000);
+        assert_eq!(r.smoothed_rtt.unwrap(), Duration::from_millis(50));
+
+        // We pace this outgoing packet. as all conditions for pacing
+        // are passed.
+        assert_eq!(r.pacing_rate, (12000.0 / 0.05) as u64);
+        assert_eq!(
+            r.get_packet_send_time().unwrap(),
+            now + Duration::from_micros(
+                (6500 * 1000000) / (12000.0 / 0.05) as u64
+            )
+        );
     }
 }
 

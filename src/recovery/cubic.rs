@@ -49,6 +49,7 @@ pub static CUBIC: CongestionControlOps = CongestionControlOps {
     on_packet_acked,
     congestion_event,
     collapse_cwnd,
+    has_custom_pacing,
 };
 
 /// CUBIC Constants.
@@ -301,6 +302,10 @@ fn congestion_event(
             r.hystart.congestion_event();
         }
     }
+}
+
+fn has_custom_pacing() -> bool {
+    false
 }
 
 #[cfg(test)]
