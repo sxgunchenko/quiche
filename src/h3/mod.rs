@@ -160,6 +160,10 @@
 //!             // Peer terminated stream, handle it.
 //!         },
 //!
+//!         Ok((stream_id, quiche::h3::Event::Reset(err))) => {
+//!             // Peer reset the stream, handle it.
+//!         },
+//!
 //!         Ok((_flow_id, quiche::h3::Event::Datagram)) => (),
 //!
 //!         Ok((goaway_id, quiche::h3::Event::GoAway)) => {
@@ -211,6 +215,10 @@
 //!
 //!         Ok((stream_id, quiche::h3::Event::Finished)) => {
 //!             // Peer terminated stream, handle it.
+//!         },
+//!
+//!         Ok((stream_id, quiche::h3::Event::Reset(err))) => {
+//!             // Peer reset the stream, handle it.
 //!         },
 //!
 //!         Ok((_flow_id, quiche::h3::Event::Datagram)) => (),
@@ -609,6 +617,9 @@ pub enum Event {
 
     /// Stream was closed,
     Finished,
+
+    /// Stream was reset.
+    Reset(u64),
 
     /// DATAGRAM was received.
     ///
@@ -1289,6 +1300,11 @@ impl Connection {
                     Ok(v) => Some(v),
 
                     Err(Error::Done) => None,
+
+                    // Return early if the stream was reset, to avoid returning
+                    // a Finished event later as well.
+                    Err(Error::TransportError(crate::Error::StreamReset(e))) =>
+                        return Ok((s, Event::Reset(e))),
 
                     Err(e) => return Err(e),
                 };
@@ -4180,6 +4196,62 @@ mod tests {
         assert_eq!(s.pipe.advance(), Ok(()));
 
         assert_eq!(s.poll_client(), Err(Error::Done));
+        assert_eq!(s.poll_server(), Err(Error::Done));
+    }
+
+    #[test]
+    fn reset_stream() {
+        let mut buf = [0; 65535];
+
+        let mut s = Session::default().unwrap();
+        s.handshake().unwrap();
+
+        // Client sends request.
+        let (stream, req) = s.send_request(false).unwrap();
+
+        let ev_headers = Event::Headers {
+            list: req,
+            has_body: true,
+        };
+
+        // Server sends response and closes stream.
+        assert_eq!(s.poll_server(), Ok((stream, ev_headers)));
+        assert_eq!(s.poll_server(), Err(Error::Done));
+
+        let resp = s.send_response(stream, true).unwrap();
+
+        let ev_headers = Event::Headers {
+            list: resp,
+            has_body: false,
+        };
+
+        assert_eq!(s.poll_client(), Ok((stream, ev_headers)));
+        assert_eq!(s.poll_client(), Ok((stream, Event::Finished)));
+        assert_eq!(s.poll_client(), Err(Error::Done));
+
+        // Client sends RESET_STREAM, closing stream.
+        let frames = [crate::frame::Frame::ResetStream {
+            stream_id: stream,
+            error_code: 42,
+            final_size: 68,
+        }];
+
+        let pkt_type = crate::packet::Type::Short;
+        assert_eq!(
+            s.pipe.send_pkt_to_server(pkt_type, &frames, &mut buf),
+            Ok(39)
+        );
+
+        // Server issues Finished event for the stream.
+        assert_eq!(s.poll_server(), Ok((stream, Event::Reset(42))));
+        assert_eq!(s.poll_server(), Err(Error::Done));
+
+        // Sending RESET_STREAM again shouldn't trigger another Finished event.
+        assert_eq!(
+            s.pipe.send_pkt_to_server(pkt_type, &frames, &mut buf),
+            Ok(39)
+        );
+
         assert_eq!(s.poll_server(), Err(Error::Done));
     }
 }
