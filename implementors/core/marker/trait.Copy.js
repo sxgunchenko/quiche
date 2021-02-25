@@ -1,0 +1,3 @@
+(function() {var implementors = {};
+implementors["quiche"] = [{"text":"impl Copy for Error","synthetic":false,"types":[]},{"text":"impl Copy for Error","synthetic":false,"types":[]},{"text":"impl Copy for Type","synthetic":false,"types":[]},{"text":"impl Copy for CongestionControlAlgorithm","synthetic":false,"types":[]}];
+if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()
